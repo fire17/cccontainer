@@ -11,7 +11,7 @@ update it, monitor it, stop it.
 
 Invoking `/ccc` runs `cccontainer new`, which:
 
-1. resolves your current [herdr](https://github.com) pane (`identify`),
+1. resolves your current herdr pane (`identify`),
 2. captures a fresh host login (`sa capture`, the vanilla two-file form),
 3. splits a pane to the right, and
 4. boots a container that injects the login and `exec claude`.
