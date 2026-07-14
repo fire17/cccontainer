@@ -6,18 +6,25 @@ in a new pane beside the current one.
 
 ## What this is
 
-- **`/ccc`** — a Claude Code skill. When invoked it runs `cccontainer new`: resolves the
-  current herdr pane (`identify`), captures a fresh host login (`sa capture`), splits a
-  pane to the right, and boots a container that injects the login (vanilla form) and
-  `exec claude`. Result: a fresh, signed-in Claude Code in a throwaway container next to you.
-- **`cccontainer`** — the batteries-included CLI to observe and DRIVE that inner session:
-  `new · ls · watch · info · screen · send · say · key · ask · exec · update · logs · stop · enter`.
-  See `cccontainer help`.
+- **`/ccc`** — a Claude Code skill. Two launch modes, both **auto-logged-in as the host's
+  current account** (fresh `sa capture` at launch → inject vanilla two-file login):
+  - `ccc new` — resolves the current herdr pane (`identify`), splits right, `exec claude`.
+  - `ccc tmux` — boots in the **current shell**; Claude runs in an **in-container tmux**
+    session (`main`), attachable/drivable from anywhere (incl. another sandboxed agent) via
+    `docker exec … tmux`. Prints an attach banner led by the enter one-liner; auto-attaches
+    if the shell is interactive.
+- **`ccc` / `cccontainer`** — same CLI, both symlinked onto PATH (`~/.local/bin`). Observe
+  and DRIVE the inner session:
+  `new · tmux · attach · ls · watch · info · screen · send · say · key · ask · exec · update · logs · stop · enter`.
+  Drive commands are **kind-aware** (herdr pane vs `docker exec … tmux`). See `ccc help`.
+- **Enter one-liner** (tmux mode): `docker exec -it <name> tmux attach -t main` (or
+  `ccc attach <name>`) — printed in the banner right after `ccc tmux`.
 
 ## Where it lives (original locations)
 
-- Skill + CLI: `~/.claude/skills/ccc/` — `SKILL.md`, `cccontainer` (CLI, incl. `new`), `launch.sh` (in-pane boot).
-- CLI on PATH via symlink: `~/.local/bin/cccontainer` → `~/.claude/skills/ccc/cccontainer`.
+- Skill + CLI: `~/.claude/skills/ccc/` — `SKILL.md`, `cccontainer` (CLI: `new`/`tmux`/`attach`/…), `launch.sh` (herdr in-pane boot).
+- CLI on PATH via symlinks: `~/.local/bin/cccontainer` **and** `~/.local/bin/ccc` → `~/.claude/skills/ccc/cccontainer`.
+- Images: `new` → `swapaccounts:latest`; `tmux` → `cccontainer:latest` (built once = swapaccounts + tmux).
 - Frozen copies here: `files/skills/ccc/` and `skills/ccc/`.
 
 ## Depends on (NOT copied — external subsystems it drives)

@@ -42,15 +42,101 @@ cmd_new(){
   echo "cccontainer: launching. watch it in the new pane, or: cccontainer ls"
 }
 
+# --- shared: capture host login + stage it for a container -------------------
+_resolve_email(){ local e="${1:-}"; [ -n "$e" ] || e="$(python3 -c 'import json,os;print(json.load(open(os.path.expanduser("~/.claude.json")))["oauthAccount"]["emailAddress"])' 2>/dev/null)"; echo "$e"; }
+_stage_login(){ # <email> <name> → prints STAGE dir, or empty on failure
+  local e="$1" n="$2" log="$HOME/.accounttracker/logins/$1" stage="$HOME/.accounttracker/.stage/$2"
+  ( cd "$HOME/Creations/AccountTracker/SwapAccounts" && ./sa capture >/dev/null 2>&1 ) || true
+  [ -d "$log" ] || return 1
+  rm -rf "$stage"; mkdir -p "$stage"
+  cp "$log/.claude/.credentials.json" "$stage/.credentials.json"
+  cp "$log/.claude/.claude.json"      "$stage/.claude.json"
+  chmod 644 "$stage"/.credentials.json "$stage"/.claude.json
+  echo "$stage"
+}
+_ensure_docker(){ echo "cccontainer: waiting for docker daemon…" >&2; until docker info >/dev/null 2>&1; do sleep 2; done; }
+# tmux-enabled image, derived from swapaccounts (built once, cached)
+_ensure_tmux_image(){
+  docker image inspect cccontainer:latest >/dev/null 2>&1 && return 0
+  docker image inspect swapaccounts:latest >/dev/null 2>&1 || die "base image swapaccounts:latest missing (build it in AccountTracker/SwapAccounts)"
+  echo "cccontainer: building cccontainer:latest (swapaccounts + tmux)…" >&2
+  docker build -t cccontainer:latest - >/dev/null 2>&1 <<'DOCKER'
+FROM swapaccounts:latest
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends tmux \
+ && rm -rf /var/lib/apt/lists/*
+USER node
+DOCKER
+}
+
+# --- tmux: container in the CURRENT shell, Claude in in-container tmux ---------
+# Detached container; Claude runs in tmux session 'main'; anyone with docker
+# access (this shell OR another sandboxed agent) can attach and drive it.
+cmd_tmux(){
+  local email name stage
+  email="$(_resolve_email "${1:-}")"; [ -n "$email" ] || die "no host account signed in and no email given"
+  _ensure_docker; _ensure_tmux_image
+  echo "cccontainer: capturing fresh login for ${email}…" >&2
+  stage="$(_stage_login "$email" "tmp")" || die "no captured login for $email — run: sa capture"
+  name="cc-tmux-$(date +%H%M%S)"
+  mv "$HOME/.accounttracker/.stage/tmp" "$HOME/.accounttracker/.stage/$name"
+  stage="$HOME/.accounttracker/.stage/$name"
+  docker run -d --rm --name "$name" \
+    --label ccc=1 --label ccc.kind=tmux --label "ccc.email=$email" \
+    -v "$stage:/staging:ro" cccontainer:latest bash -c '
+      mkdir -p "$HOME/.claude"
+      cp /staging/.credentials.json "$HOME/.claude/.credentials.json"
+      cp /staging/.claude.json      "$HOME/.claude.json"
+      chmod 600 "$HOME/.claude/.credentials.json"
+      tmux new-session -d -s main claude
+      exec tmux wait-for ccc_hold   # keep PID 1 alive; never signalled
+    ' >/dev/null || die "docker run failed"
+  _attach_banner "$name"
+  # auto-attach the current shell if interactive
+  if [ -t 0 ] && [ -t 1 ]; then
+    echo "cccontainer: attaching this shell (detach with Ctrl-b d)…"
+    exec docker exec -it "$name" tmux attach -t main
+  fi
+}
+
+_attach_banner(){
+  local n="$1"
+  cat <<EOF
+
+┌─ cccontainer '$n' — fresh Claude Code in tmux (session 'main') ───────────────
+│ ▶ ENTER IT (one-liner):   docker exec -it $n tmux attach -t main
+│                     (or:  ccc attach $n)          detach with Ctrl-b d
+│
+│ ATTACH & DRIVE from this host:
+│   ccc attach $n                             # interactive (Ctrl-b d to detach)
+│   docker exec -it $n tmux attach -t main
+│
+│ DRIVE headless (any agent with docker access, incl. another sandboxed agent):
+│   cccontainer screen $n                     # read the live screen
+│   cccontainer say    $n "your prompt"       # type + Enter
+│   cccontainer key    $n Enter               # send a key
+│   docker exec $n tmux capture-pane -pt main # raw read
+│   docker exec $n tmux send-keys -t main -l "hi"; docker exec $n tmux send-keys -t main Enter
+│
+│ From ANOTHER container/agent: give it this docker socket
+│   (-v /var/run/docker.sock:/var/run/docker.sock) then run the same commands.
+│ STOP: cccontainer stop $n
+└───────────────────────────────────────────────────────────────────────────────
+EOF
+}
+cmd_attach(){ local c; c="$(_need "$1")"; docker exec -it "$c" tmux attach -t main; }
+
 # --- observability -----------------------------------------------------------
 cmd_ls(){
   local ids; ids="$(docker ps -q --filter label=ccc=1)"
   [ -n "$ids" ] || { echo "(no ccc containers running)"; return; }
-  printf '%-22s %-26s %-14s %s\n' NAME ACCOUNT PANE STATUS
-  local c; for c in $ids; do
-    printf '%-22s %-26s %-14s %s\n' \
+  printf '%-18s %-26s %-14s %s\n' NAME ACCOUNT WHERE STATUS
+  local c k where; for c in $ids; do
+    k="$(_lbl "$c" ccc.kind)"
+    if [ "$k" = tmux ]; then where="tmux:main"; else where="$(_lbl "$c" ccc.pane)"; fi
+    printf '%-18s %-26s %-14s %s\n' \
       "$(docker inspect -f '{{.Name}}' "$c" | sed 's#^/##')" \
-      "$(_lbl "$c" ccc.email)" "$(_lbl "$c" ccc.pane)" \
+      "$(_lbl "$c" ccc.email)" "$where" \
       "$(docker inspect -f '{{.State.Status}}' "$c")"
   done
 }
@@ -65,12 +151,20 @@ cmd_info(){
   echo "processes :"; docker top "$c" -o pid,cmd 2>/dev/null | grep -iE 'claude|node|PID' | head
 }
 
-# --- drive the live interactive session (via the herdr pane) ------------------
-_pane(){ local c; c="$(_need "$1")"; echo "$(_lbl "$c" ccc.hsession) $(_lbl "$c" ccc.pane)"; }
-cmd_screen(){ read -r hs p < <(_pane "$1"); hd --session "$hs" pane read "$p" --source "${3:-visible}" --lines "${2:-40}"; }
-cmd_send(){ read -r hs p < <(_pane "$1"); shift; hd --session "$hs" pane send-text "$p" "$*"; }
-cmd_key(){  read -r hs p < <(_pane "$1"); shift; hd --session "$hs" pane send-keys "$p" "$@"; }
-cmd_say(){  read -r hs p < <(_pane "$1"); local n="$1"; shift; hd --session "$hs" pane send-text "$p" "$*"; sleep 0.4; hd --session "$hs" pane send-keys "$p" Enter; }
+# --- drive the live session (kind-aware: herdr pane, or in-container tmux) -----
+# tmux-kind containers run Claude in tmux session 'main'; herdr-kind in a herdr pane.
+cmd_screen(){ local c k; c="$(_need "$1")"; k="$(_lbl "$c" ccc.kind)"
+  if [ "$k" = tmux ]; then docker exec "$c" tmux capture-pane -pt main 2>&1 | tail -n "${2:-40}"
+  else hd --session "$(_lbl "$c" ccc.hsession)" pane read "$(_lbl "$c" ccc.pane)" --source "${3:-visible}" --lines "${2:-40}"; fi; }
+cmd_send(){ local c k; c="$(_need "$1")"; k="$(_lbl "$c" ccc.kind)"; shift
+  if [ "$k" = tmux ]; then docker exec "$c" tmux send-keys -t main -l "$*"
+  else hd --session "$(_lbl "$c" ccc.hsession)" pane send-text "$(_lbl "$c" ccc.pane)" "$*"; fi; }
+cmd_key(){ local c k; c="$(_need "$1")"; k="$(_lbl "$c" ccc.kind)"; shift
+  if [ "$k" = tmux ]; then docker exec "$c" tmux send-keys -t main "$@"
+  else hd --session "$(_lbl "$c" ccc.hsession)" pane send-keys "$(_lbl "$c" ccc.pane)" "$@"; fi; }
+cmd_say(){ local c k; c="$(_need "$1")"; k="$(_lbl "$c" ccc.kind)"; shift
+  if [ "$k" = tmux ]; then docker exec "$c" tmux send-keys -t main -l "$*"; sleep 0.4; docker exec "$c" tmux send-keys -t main Enter
+  else hd --session "$(_lbl "$c" ccc.hsession)" pane send-text "$(_lbl "$c" ccc.pane)" "$*"; sleep 0.4; hd --session "$(_lbl "$c" ccc.hsession)" pane send-keys "$(_lbl "$c" ccc.pane)" Enter; fi; }
 
 # --- headless prompt (separate session, JSON result) -------------------------
 cmd_ask(){ local c; c="$(_need "$1")"; shift; docker exec -i "$c" claude -p "$*"; }
@@ -86,14 +180,21 @@ cmd_stop(){
 
 # --- copy-paste entry commands (read-only / full shell / by PID) --------------
 cmd_enter(){
-  local c hs p pid; c="$(_need "$1")"
-  hs="$(_lbl "$c" ccc.hsession)"; p="$(_lbl "$c" ccc.pane)"
+  local c k hs p pid; c="$(_need "$1")"; k="$(_lbl "$c" ccc.kind)"
   pid="$(docker top "$c" -o pid,cmd 2>/dev/null | awk '/claude/{print $1; exit}')"
   echo "# --- ways into '$1' (container $c) ---"
   echo "# full shell (read-write):"
   echo "docker exec -it $c bash"
-  echo "# read-only (live view of the running Claude, cannot type):"
-  echo "hd --session $hs pane read $p --source visible"
+  if [ "$k" = tmux ]; then
+    echo "# attach the live Claude (interactive, Ctrl-b d to detach):"
+    echo "docker exec -it $c tmux attach -t main    # or: cccontainer attach $1"
+    echo "# read-only (view without typing):"
+    echo "watch -n1 'docker exec $c tmux capture-pane -pt main'   # or: cccontainer screen $1"
+  else
+    hs="$(_lbl "$c" ccc.hsession)"; p="$(_lbl "$c" ccc.pane)"
+    echo "# read-only (live view of the running Claude, cannot type):"
+    echo "hd --session $hs pane read $p --source visible"
+  fi
   echo "# by PID (Claude pid ${pid:-?} inside the container):"
   echo "docker exec -it $c bash    # then inspect/kill $pid  (e.g. cat /proc/$pid/status)"
 }
@@ -101,7 +202,10 @@ cmd_enter(){
 usage(){ cat <<'EOF'
 cccontainer — sandboxed, signed-in Claude Code containers you can fully drive.
 
-  new [email]              split a pane and boot a fresh signed-in Claude Code
+  new [email]              split a herdr pane and boot a fresh signed-in Claude Code
+  tmux [email]             boot in the CURRENT shell — Claude in in-container tmux,
+                           attachable/drivable from anywhere (another agent) via docker
+  attach <name>            attach the live Claude (docker exec -it … tmux attach)
   ls                       list running ccc containers
   watch [secs]             live-refresh the list
   info <name>              account, version, pane, processes
@@ -124,7 +228,8 @@ EOF
 
 sub="${1:-}"; shift || true
 case "$sub" in
-  new) cmd_new "$@";; ls|list) cmd_ls "$@";; watch) cmd_watch "$@";;
+  new) cmd_new "$@";; tmux) cmd_tmux "$@";; attach) cmd_attach "$@";;
+  ls|list) cmd_ls "$@";; watch) cmd_watch "$@";;
   info) cmd_info "$@";; screen) cmd_screen "$@";; send) cmd_send "$@";;
   say) cmd_say "$@";; key) cmd_key "$@";; ask) cmd_ask "$@";;
   exec) cmd_exec "$@";; update) cmd_update "$@";; logs) cmd_logs "$@";;
