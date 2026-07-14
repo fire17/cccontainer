@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# cccontainer — launch, watch, stop, enter and fully DRIVE sandboxed Claude Code
+# containers. Each container runs a fresh, signed-in Claude Code (vanilla login form).
+# Batteries included: control the live session, read its screen, run headless prompts,
+# exec anything inside. Thin wrappers over `docker` + `hd` (herdr) — no new deps.
+set -u
+export PATH="/opt/homebrew/bin:$PATH"
+
+# resolve this script's real dir (works through the ~/.local/bin symlink)
+SELF="${BASH_SOURCE[0]}"; while [ -L "$SELF" ]; do SELF="$(readlink "$SELF")"; done
+DIR="$(cd "$(dirname "$SELF")" && pwd)"
+IDENTIFY="$HOME/.claude/skills/identify/identify.py"
+
+die(){ echo "cccontainer: $*" >&2; exit 1; }
+
+# --- helpers -----------------------------------------------------------------
+_cid(){ docker ps -q --filter "label=ccc=1" --filter "name=^$1$" | head -1; }
+_lbl(){ docker inspect -f "{{ index .Config.Labels \"$2\" }}" "$1" 2>/dev/null; }
+_need(){ local c; c="$(_cid "$1")"; [ -n "$c" ] || die "no running container '$1' (see: cccontainer ls)"; echo "$c"; }
+
+# --- new: split a pane next to us and boot a signed-in claude container -------
+cmd_new(){
+  local email name js hs pane newpane
+  email="${1:-}"
+  [ -n "$email" ] || email="$(python3 -c 'import json,os;print(json.load(open(os.path.expanduser("~/.claude.json")))["oauthAccount"]["emailAddress"])' 2>/dev/null)"
+  [ -n "$email" ] || die "no host account signed in and no email given"
+  js="$(python3 "$IDENTIFY" 2>/dev/null | head -1)"
+  hs="$(printf '%s' "$js"  | python3 -c 'import sys,json;print(json.load(sys.stdin).get("herdr_session") or "")')"
+  pane="$(printf '%s' "$js"| python3 -c 'import sys,json;print(json.load(sys.stdin).get("herdr_pane") or "")')"
+  [ -n "$hs" ] && [ -n "$pane" ] || die "not inside a herdr pane (identify found none)"
+
+  echo "cccontainer: capturing fresh login for ${email}…"
+  ( cd "$HOME/Creations/AccountTracker/SwapAccounts" && ./sa capture >/dev/null 2>&1 ) || true
+
+  newpane="$(hd --session "$hs" pane split "$pane" --direction right --ratio 0.5 --no-focus 2>/dev/null \
+            | python3 -c 'import sys,json;print(json.load(sys.stdin)["result"]["pane"]["pane_id"])')"
+  [ -n "$newpane" ] || die "pane split failed"
+  name="cc-$(printf '%s' "$newpane" | tr -c 'A-Za-z0-9_.-' '-')"
+  echo "cccontainer: pane $newpane → container $name"
+  hd --session "$hs" pane run "$newpane" \
+     "bash '$DIR/launch.sh' '$email' '$name' '$hs' '$newpane'" >/dev/null 2>&1
+  echo "cccontainer: launching. watch it in the new pane, or: cccontainer ls"
+}
+
+# --- observability -----------------------------------------------------------
+cmd_ls(){
+  local ids; ids="$(docker ps -q --filter label=ccc=1)"
+  [ -n "$ids" ] || { echo "(no ccc containers running)"; return; }
+  printf '%-22s %-26s %-14s %s\n' NAME ACCOUNT PANE STATUS
+  local c; for c in $ids; do
+    printf '%-22s %-26s %-14s %s\n' \
+      "$(docker inspect -f '{{.Name}}' "$c" | sed 's#^/##')" \
+      "$(_lbl "$c" ccc.email)" "$(_lbl "$c" ccc.pane)" \
+      "$(docker inspect -f '{{.State.Status}}' "$c")"
+  done
+}
+cmd_watch(){ while true; do clear; date; echo; cmd_ls; sleep "${1:-3}"; done; }
+cmd_info(){
+  local c; c="$(_need "$1")"
+  echo "container : $1  ($c)"
+  echo "account   : $(_lbl "$c" ccc.email)"
+  echo "pane      : $(_lbl "$c" ccc.hsession):$(_lbl "$c" ccc.pane)"
+  echo "version   : $(docker exec "$c" claude --version 2>&1)"
+  echo "signed-in : $(docker exec "$c" node -e 'console.log(require("/home/node/.claude.json").oauthAccount.emailAddress)' 2>&1)"
+  echo "processes :"; docker top "$c" -o pid,cmd 2>/dev/null | grep -iE 'claude|node|PID' | head
+}
+
+# --- drive the live interactive session (via the herdr pane) ------------------
+_pane(){ local c; c="$(_need "$1")"; echo "$(_lbl "$c" ccc.hsession) $(_lbl "$c" ccc.pane)"; }
+cmd_screen(){ read -r hs p < <(_pane "$1"); hd --session "$hs" pane read "$p" --source "${3:-visible}" --lines "${2:-40}"; }
+cmd_send(){ read -r hs p < <(_pane "$1"); shift; hd --session "$hs" pane send-text "$p" "$*"; }
+cmd_key(){  read -r hs p < <(_pane "$1"); shift; hd --session "$hs" pane send-keys "$p" "$@"; }
+cmd_say(){  read -r hs p < <(_pane "$1"); local n="$1"; shift; hd --session "$hs" pane send-text "$p" "$*"; sleep 0.4; hd --session "$hs" pane send-keys "$p" Enter; }
+
+# --- headless prompt (separate session, JSON result) -------------------------
+cmd_ask(){ local c; c="$(_need "$1")"; shift; docker exec -i "$c" claude -p "$*"; }
+
+# --- run anything inside -----------------------------------------------------
+cmd_exec(){ local c f=-i; c="$(_need "$1")"; shift; [ "${1:-}" = "--" ] && shift; [ -t 0 ] && f=-it; docker exec $f "$c" "${@:-bash}"; }
+cmd_update(){ local c; c="$(_need "$1")"; docker exec -u root "$c" npm i -g @anthropic-ai/claude-code@latest 2>&1 | tail -2; docker exec "$c" claude --version; }
+cmd_logs(){ local c; c="$(_need "$1")"; docker logs -f "$c"; }
+cmd_stop(){
+  if [ "${1:-}" = "all" ]; then docker ps -q --filter label=ccc=1 | xargs -r docker stop; return; fi
+  docker stop "$(_need "$1")"
+}
+
+# --- copy-paste entry commands (read-only / full shell / by PID) --------------
+cmd_enter(){
+  local c hs p pid; c="$(_need "$1")"
+  hs="$(_lbl "$c" ccc.hsession)"; p="$(_lbl "$c" ccc.pane)"
+  pid="$(docker top "$c" -o pid,cmd 2>/dev/null | awk '/claude/{print $1; exit}')"
+  echo "# --- ways into '$1' (container $c) ---"
+  echo "# full shell (read-write):"
+  echo "docker exec -it $c bash"
+  echo "# read-only (live view of the running Claude, cannot type):"
+  echo "hd --session $hs pane read $p --source visible"
+  echo "# by PID (Claude pid ${pid:-?} inside the container):"
+  echo "docker exec -it $c bash    # then inspect/kill $pid  (e.g. cat /proc/$pid/status)"
+}
+
+usage(){ cat <<'EOF'
+cccontainer — sandboxed, signed-in Claude Code containers you can fully drive.
+
+  new [email]              split a pane and boot a fresh signed-in Claude Code
+  ls                       list running ccc containers
+  watch [secs]             live-refresh the list
+  info <name>              account, version, pane, processes
+  stop <name|all>          stop (and auto-remove) container(s)
+  enter <name>             print copy-paste commands: read-only / full shell / PID
+
+  drive the live session:
+  screen <name> [lines]    read what the running Claude shows
+  send <name> <text>       type text into the session (no Enter)
+  say  <name> <text>       type text and press Enter
+  key  <name> <keys...>    send keys (Enter, Escape, …)
+
+  batteries:
+  ask  <name> <prompt>     headless one-shot prompt (claude -p), JSON out
+  exec <name> [-- cmd...]  run any command inside (default: bash)
+  update <name>            update Claude Code inside to latest
+  logs <name>              follow container stdout
+EOF
+}
+
+sub="${1:-}"; shift || true
+case "$sub" in
+  new) cmd_new "$@";; ls|list) cmd_ls "$@";; watch) cmd_watch "$@";;
+  info) cmd_info "$@";; screen) cmd_screen "$@";; send) cmd_send "$@";;
+  say) cmd_say "$@";; key) cmd_key "$@";; ask) cmd_ask "$@";;
+  exec) cmd_exec "$@";; update) cmd_update "$@";; logs) cmd_logs "$@";;
+  stop) cmd_stop "$@";; enter) cmd_enter "$@";; ""|-h|--help|help) usage;;
+  *) die "unknown command '$sub' (see: cccontainer help)";;
+esac

@@ -1,0 +1,4 @@
+# private: verbatim session transcript + live snapshot — never publish
+conversation/
+.save_and_ship/
+.DS_Store
