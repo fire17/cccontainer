@@ -124,7 +124,13 @@ _attach_banner(){
 └───────────────────────────────────────────────────────────────────────────────
 EOF
 }
-cmd_attach(){ local c; c="$(_need "$1")"; docker exec -it "$c" tmux attach -t main; }
+cmd_attach(){ local c k; c="$(_need "$1")"; k="$(_lbl "$c" ccc.kind)"
+  if [ "$k" = tmux ]; then docker exec -it "$c" tmux attach -t main
+  else
+    echo "cccontainer: '$1' is herdr-mode (no tmux) — its Claude lives in herdr pane $(_lbl "$c" ccc.hsession):$(_lbl "$c" ccc.pane)." >&2
+    echo "cccontainer: opening a shell inside instead (Claude is the pane, not this shell)." >&2
+    docker exec -it "$c" bash
+  fi; }
 
 # --- observability -----------------------------------------------------------
 cmd_ls(){
